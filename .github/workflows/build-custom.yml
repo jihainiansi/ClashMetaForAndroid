@@ -1,0 +1,95 @@
+name: Build CMFA UI Mod
+
+on:
+  workflow_dispatch:
+
+jobs:
+  BuildCustom:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout submodules
+        run: git submodule update --init --recursive --force
+
+      - name: Normalize line endings
+        run: |
+          python3 -c "import pathlib; [p.write_bytes(p.read_bytes().replace(bytes([13]), b'')) for p in list(pathlib.Path('design/src').rglob('*')) + list(pathlib.Path('app/src').rglob('*')) if p.suffix in ('.xml', '.kt')]"
+          sed -i 's/#FFFFFF/#FDF1F4/' app/src/main/res/values/ic_launcher_background.xml
+
+      - name: Apply UI patch
+        run: git apply --verbose .github/patches/ui-mod.patch
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
+          go-version: '1.26'
+
+      - name: Apply Go Patches
+        run: |
+          cd $(go env GOROOT)
+          for p in $GITHUB_WORKSPACE/.github/patch/*.patch; do patch --verbose -p 1 < "$p"; done
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Update CA
+        run: |
+          sudo apt-get update && sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt core/src/foss/golang/clash/component/ca/ca-certificates.crt
+
+      - name: Remove bundled keystore
+        run: rm -f release.keystore
+
+      - name: Restore fixed signing key
+        id: signkey
+        uses: actions/cache@v5
+        with:
+          path: release.keystore
+          key: cmfa-ui-mod-signing-v1
+
+      - name: Create signing key on first build
+        if: steps.signkey.outputs.cache-hit != 'true'
+        run: |
+          keytool -genkeypair -v -keystore release.keystore -alias cmfaui             -keyalg RSA -keysize 2048 -validity 10000             -storepass crmfa2026 -keypass crmfa2026             -dname "CN=CMFA UI Mod, OU=Personal, O=Personal, L=Taiyuan, ST=Shanxi, C=CN"
+
+      - name: Write signing.properties
+        run: |
+          printf 'keystore.password=crmfa2026\nkey.alias=cmfaui\nkey.password=crmfa2026\n' > signing.properties
+
+      - name: Release Build
+        run: ./gradlew --no-daemon app:assembleAlphaRelease
+
+      - name: Upload APK (arm64-v8a)
+        uses: actions/upload-artifact@v7
+        with:
+          name: CMFA-UI-Mod-arm64
+          path: app/build/outputs/apk/alpha/release/*-arm64-v8a-*.apk
+          if-no-files-found: error
+
+      - name: Upload signing key backup
+        uses: actions/upload-artifact@v7
+        with:
+          name: signing-key-backup
+          path: release.keystore
+          if-no-files-found: warn

@@ -1,0 +1,456 @@
+diff --git a/app/src/main/java/com/github/kr328/clash/MainActivity.kt b/app/src/main/java/com/github/kr328/clash/MainActivity.kt
+index ea8254c..27c6ae2 100644
+--- a/app/src/main/java/com/github/kr328/clash/MainActivity.kt
++++ b/app/src/main/java/com/github/kr328/clash/MainActivity.kt
+@@ -22,6 +22,9 @@ import com.github.kr328.clash.util.stopClashService
+ import com.github.kr328.clash.util.withClash
+ import com.github.kr328.clash.util.withProfile
+ import com.github.kr328.clash.core.bridge.*
++import com.github.kr328.clash.core.Clash
++import com.github.kr328.clash.core.model.ProxySort
++import com.github.kr328.clash.core.model.TunnelState
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.selects.select
+@@ -30,6 +33,8 @@ import java.util.concurrent.TimeUnit
+ import com.github.kr328.clash.design.R as DesignR
+ 
+ class MainActivity : BaseActivity<MainDesign>() {
++    private var globalMode = false
++
+     override suspend fun main() {
+         val design = MainDesign(this)
+ 
+@@ -43,9 +48,14 @@ class MainActivity : BaseActivity<MainDesign>() {
+             select<Unit> {
+                 events.onReceive {
+                     when (it) {
+-                        Event.ActivityStart,
++                        Event.ActivityStart, Event.ClashStart -> {
++                            design.fetch()
++
++                            if (restoreLastMode())
++                                design.fetch()
++                        }
+                         Event.ServiceRecreated,
+-                        Event.ClashStop, Event.ClashStart,
++                        Event.ClashStop,
+                         Event.ProfileLoaded, Event.ProfileChanged -> design.fetch()
+                         else -> Unit
+                     }
+@@ -60,6 +70,25 @@ class MainActivity : BaseActivity<MainDesign>() {
+                         }
+                         MainDesign.Request.OpenProxy ->
+                             startActivity(ProxyActivity::class.intent)
++                        MainDesign.Request.ToggleGlobalMode -> {
++                            val next = if (globalMode)
++                                TunnelState.Mode.Rule
++                            else
++                                TunnelState.Mode.Global
++
++                            withClash {
++                                val o = queryOverride(Clash.OverrideSlot.Session)
++                                o.mode = next
++                                patchOverride(Clash.OverrideSlot.Session, o)
++                            }
++
++                            uiStore.lastMode = modeKey(next)
++                            globalMode = !globalMode
++                            design.setMode(next)
++                            design.setGlobalNode(
++                                if (next == TunnelState.Mode.Global) queryGlobalNodeName() else null
++                            )
++                        }
+                         MainDesign.Request.OpenProfiles ->
+                             startActivity(ProfilesActivity::class.intent)
+                         MainDesign.Request.OpenProviders ->
+@@ -98,7 +127,9 @@ class MainActivity : BaseActivity<MainDesign>() {
+             queryProviders()
+         }
+ 
++        globalMode = state.mode == TunnelState.Mode.Global
+         setMode(state.mode)
++        setGlobalNode(if (globalMode) queryGlobalNodeName() else null)
+         setHasProviders(providers.isNotEmpty())
+ 
+         withProfile {
+@@ -112,6 +143,51 @@ class MainActivity : BaseActivity<MainDesign>() {
+         }
+     }
+ 
++    private fun modeKey(mode: TunnelState.Mode): String = when (mode) {
++        TunnelState.Mode.Global -> "global"
++        TunnelState.Mode.Direct -> "direct"
++        else -> "rule"
++    }
++
++    private fun keyMode(key: String): TunnelState.Mode? = when (key) {
++        "global" -> TunnelState.Mode.Global
++        "direct" -> TunnelState.Mode.Direct
++        "rule" -> TunnelState.Mode.Rule
++        else -> null
++    }
++
++    private suspend fun queryGlobalNodeName(): String? = runCatching {
++        withClash {
++            queryProxyGroup("GLOBAL", ProxySort.Default).now.takeIf { it.isNotBlank() }
++        }
++    }.getOrNull()
++
++    /**
++     * 恢复上次退出前的模式（规则 / 全局）。
++     * 模式存在 Session override 里，VPN 重启后会回到配置文件默认值，所以每次进入界面时补一次。
++     */
++    private suspend fun restoreLastMode(): Boolean = runCatching {
++        if (!clashRunning)
++            return@runCatching false
++
++        val target = keyMode(uiStore.lastMode) ?: return@runCatching false
++
++        val current = withClash { queryTunnelState().mode }
++
++        if (current == target || current == TunnelState.Mode.Script)
++            return@runCatching false
++
++        withClash {
++            val o = queryOverride(Clash.OverrideSlot.Session)
++
++            o.mode = target
++
++            patchOverride(Clash.OverrideSlot.Session, o)
++        }
++
++        true
++    }.getOrDefault(false)
++
+     private suspend fun MainDesign.startClash() {
+         val active = withProfile { queryActive() }
+ 
+diff --git a/app/src/main/java/com/github/kr328/clash/ProxyActivity.kt b/app/src/main/java/com/github/kr328/clash/ProxyActivity.kt
+index 9136a30..d970e6d 100644
+--- a/app/src/main/java/com/github/kr328/clash/ProxyActivity.kt
++++ b/app/src/main/java/com/github/kr328/clash/ProxyActivity.kt
+@@ -3,6 +3,7 @@ package com.github.kr328.clash
+ import com.github.kr328.clash.common.util.intent
+ import com.github.kr328.clash.core.Clash
+ import com.github.kr328.clash.core.model.Proxy
++import com.github.kr328.clash.core.model.TunnelState
+ import com.github.kr328.clash.design.ProxyDesign
+ import com.github.kr328.clash.design.model.ProxyState
+ import com.github.kr328.clash.util.withClash
+@@ -14,7 +15,7 @@ import kotlinx.coroutines.sync.withPermit
+ 
+ class ProxyActivity : BaseActivity<ProxyDesign>() {
+     override suspend fun main() {
+-        val mode = withClash { queryOverride(Clash.OverrideSlot.Session).mode }
++        var currentMode = withClash { queryOverride(Clash.OverrideSlot.Session).mode }
+         val names = withClash { queryProxyGroupNames(uiStore.proxyExcludeNotSelectable) }
+         val states = List(names.size) { ProxyState("?") }
+         val unorderedStates = names.indices.map { names[it] to states[it] }.toMap()
+@@ -22,9 +23,11 @@ class ProxyActivity : BaseActivity<ProxyDesign>() {
+ 
+         val design = ProxyDesign(
+             this,
+-            mode,
++            currentMode,
+             names,
+-            uiStore
++            uiStore,
++            // 全局模式下，进入代理页默认落在 GLOBAL 分组
++            if (currentMode == TunnelState.Mode.Global) "GLOBAL" else null
+         )
+ 
+         setContentDesign(design)
+@@ -102,6 +105,8 @@ class ProxyActivity : BaseActivity<ProxyDesign>() {
+                         is ProxyDesign.Request.PatchMode -> {
+                             design.showModeSwitchTips()
+ 
++                            val before = currentMode
++
+                             withClash {
+                                 val o = queryOverride(Clash.OverrideSlot.Session)
+ 
+@@ -109,6 +114,23 @@ class ProxyActivity : BaseActivity<ProxyDesign>() {
+ 
+                                 patchOverride(Clash.OverrideSlot.Session, o)
+                             }
++
++                            val after = withClash { queryOverride(Clash.OverrideSlot.Session).mode }
++
++                            currentMode = after
++                            uiStore.lastMode = when (after) {
++                                TunnelState.Mode.Global -> "global"
++                                TunnelState.Mode.Direct -> "direct"
++                                else -> "rule"
++                            }
++
++                            // 进出全局模式会改变分组列表（GLOBAL 页出现/消失），
++                            // 重建页面后直接落在 GLOBAL 页，不用再手动点一下。
++                            if (before == TunnelState.Mode.Global || after == TunnelState.Mode.Global) {
++                                startActivity(ProxyActivity::class.intent)
++
++                                finish()
++                            }
+                         }
+                     }
+                 }
+diff --git a/app/src/main/res/drawable/ic_launcher_foreground.xml b/app/src/main/res/drawable/ic_launcher_foreground.xml
+index 1d8924d..9ae9585 100644
+--- a/app/src/main/res/drawable/ic_launcher_foreground.xml
++++ b/app/src/main/res/drawable/ic_launcher_foreground.xml
+@@ -8,9 +8,9 @@
+     <group>
+         <path
+             android:pathData="M 141.08 128.47 C 141.88 128.42 142.72 128.38 143.41 128.8 C 144.51 129.46 145.39 130.41 146.33 131.25 C 160.38 144.1 174.48 156.9 188.53 169.75 C 189.48 170.59 190.37 171.56 191.54 172.11 C 192.45 172.55 193.49 172.33 194.46 172.2 C 197.04 171.76 199.66 171.74 202.26 171.74 C 204.77 171.78 207.29 171.86 209.77 172.27 C 210.77 172.38 211.95 172.71 212.71 171.84 C 228.19 157.7 243.73 143.58 259.23 129.43 C 260.54 128.06 262.55 128.36 264.26 128.57 C 268.58 129.21 272.94 129.51 277.28 130 C 278 130.14 279.02 130.19 279.27 131.05 C 279.61 132.54 279.42 134.07 279.46 135.58 C 279.44 166.17 279.44 196.77 279.42 227.36 C 279.41 228.92 279.51 230.47 279.35 232.01 C 279.29 232.56 279.22 233.21 278.76 233.59 C 277.8 234.01 276.74 234.17 275.72 234.42 C 271.39 235.43 266.98 236.16 262.66 237.26 C 260.49 237.83 258.25 237.61 256.04 237.64 C 254.91 237.63 253.74 237.73 252.61 237.54 C 251.95 237.49 251.48 236.9 251.43 236.26 C 251.19 234.74 251.33 233.2 251.31 231.67 C 251.29 216.61 251.28 201.54 251.29 186.48 C 251.27 185 251.38 183.49 251.17 182.01 C 250.9 180.3 249.11 179.1 247.44 179.31 C 246.51 179.32 245.72 179.9 245.05 180.49 C 237.57 187.38 230 194.15 222.54 201.02 C 221.68 201.76 220.7 202.63 219.48 202.51 C 217.88 202.37 216.37 201.8 214.82 201.44 C 208.61 199.89 202.12 199.7 195.77 200.24 C 192.68 200.67 189.56 201.02 186.59 202 C 185.63 202.27 184.66 202.57 183.67 202.52 C 182.65 202.45 181.86 201.78 181.14 201.15 C 173.72 194.33 166.23 187.63 158.81 180.81 C 158.09 180.18 157.31 179.49 156.33 179.34 C 155.1 179.19 153.83 179.69 152.99 180.59 C 152.26 181.42 152.23 182.56 152.19 183.61 C 152.23 200.72 152.18 217.81 152.21 234.91 C 152.18 235.57 152.18 236.24 151.92 236.87 C 151.53 237.58 150.62 237.61 149.91 237.64 C 147.99 237.68 146.08 237.63 144.16 237.64 C 141.99 237.68 139.9 237.05 137.81 236.62 C 133.97 235.77 130.14 234.91 126.29 234.1 C 125.48 233.9 124.35 233.66 124.2 232.66 C 123.96 230.91 124.13 229.14 124.1 227.36 C 124.06 196.88 124.08 166.41 124.08 135.93 C 124.08 134.49 124 133.06 124.13 131.64 C 124.18 131.12 124.33 130.51 124.84 130.24 C 125.38 130 125.99 129.97 126.56 129.88 C 131.42 129.55 136.25 128.96 141.08 128.47 Z M 198.81 240.82 C 200.99 240.64 203.19 240.7 205.35 240.82 C 207.04 240.8 208.08 242.85 207.31 244.28 C 206.36 246.17 205.38 248.03 204.27 249.84 C 203.56 251.14 201.5 251.39 200.57 250.19 C 199.67 249.09 199.15 247.78 198.44 246.56 C 197.9 245.55 197.21 244.59 196.96 243.44 C 196.7 242.24 197.62 240.99 198.81 240.82 Z"
+-            android:fillColor="#3372b6"/>
++            android:fillColor="#F7B733"/>
+         <path
+             android:pathData="M 125.67 244.75 C 126.09 244.7 126.51 244.67 126.95 244.67 C 139.02 244.7 151.09 244.69 163.19 244.69 C 164.26 244.67 165.5 244.94 166.14 245.92 C 166.8 247.02 166.66 248.72 165.52 249.45 C 164.74 249.99 163.74 249.99 162.83 250.02 C 150.88 249.99 138.9 250.01 126.95 250.02 C 126.28 249.99 125.6 249.99 124.97 249.77 C 123.94 249.38 123.25 248.25 123.4 247.15 C 123.49 245.97 124.43 244.86 125.67 244.76 L 125.67 244.75 Z M 239.67 244.75 C 241.29 244.59 242.93 244.72 244.57 244.69 C 255.33 244.67 266.1 244.72 276.86 244.67 C 277.55 244.7 278.27 244.69 278.92 244.97 C 279.88 245.4 280.42 246.44 280.42 247.47 C 280.44 248.67 279.44 249.8 278.24 249.92 C 276.7 250.11 275.15 249.99 273.61 250 L 243.85 250 C 242.33 249.99 240.79 250.12 239.29 249.87 C 238.15 249.67 237.23 248.64 237.31 247.46 C 237.16 246.07 238.34 244.85 239.67 244.75 Z M 162.61 257.67 C 163.41 257.45 164.3 257.33 165.06 257.72 C 166.65 258.45 167.02 260.98 165.6 262.08 C 164.76 262.67 163.74 262.91 162.8 263.24 C 159.22 264.36 155.74 265.76 152.16 266.87 C 148.04 268.17 144 269.71 139.9 271.09 C 136.91 272.06 133.94 273.07 130.97 274.1 C 129.73 274.52 128.54 275.06 127.27 275.33 C 126.49 275.5 125.63 275.35 125.02 274.83 C 124.01 274.03 123.82 272.5 124.4 271.4 C 124.87 270.6 125.82 270.32 126.63 270 C 129.2 269.1 131.73 268.17 134.31 267.36 C 140.78 265.27 147.14 262.84 153.63 260.8 C 156.65 259.81 159.59 258.62 162.61 257.67 Z M 239.3 257.54 C 240.23 257.32 241.14 257.67 242.02 257.92 C 244.84 258.89 247.61 259.97 250.45 260.88 C 257.12 262.99 263.65 265.51 270.34 267.62 C 272.53 268.33 274.71 269.14 276.91 269.9 C 277.73 270.22 278.64 270.49 279.25 271.18 C 280.21 272.5 279.64 274.64 278.1 275.23 C 277.11 275.62 276.06 275.23 275.1 274.93 C 271.13 273.46 267.11 272.14 263.09 270.83 C 259.18 269.47 255.29 268.04 251.36 266.79 C 247.78 265.66 244.32 264.26 240.74 263.16 C 239.79 262.82 238.78 262.59 238.02 261.91 C 236.65 260.58 237.39 257.88 239.3 257.54 Z"
+-            android:fillColor="#f39800"/>
++            android:fillColor="#FFE08A"/>
+     </group>
+ </vector>
+diff --git a/design/src/main/java/com/github/kr328/clash/design/MainDesign.kt b/design/src/main/java/com/github/kr328/clash/design/MainDesign.kt
+index f418e48..c091280 100644
+--- a/design/src/main/java/com/github/kr328/clash/design/MainDesign.kt
++++ b/design/src/main/java/com/github/kr328/clash/design/MainDesign.kt
+@@ -17,6 +17,7 @@ class MainDesign(context: Context) : Design<MainDesign.Request>(context) {
+     enum class Request {
+         ToggleStatus,
+         OpenProxy,
++        ToggleGlobalMode,
+         OpenProfiles,
+         OpenProviders,
+         OpenLogs,
+@@ -51,6 +52,7 @@ class MainDesign(context: Context) : Design<MainDesign.Request>(context) {
+ 
+     suspend fun setMode(mode: TunnelState.Mode) {
+         withContext(Dispatchers.Main) {
++            binding.globalMode = mode == TunnelState.Mode.Global
+             binding.mode = when (mode) {
+                 TunnelState.Mode.Direct -> context.getString(R.string.direct_mode)
+                 TunnelState.Mode.Global -> context.getString(R.string.global_mode)
+@@ -60,6 +62,12 @@ class MainDesign(context: Context) : Design<MainDesign.Request>(context) {
+         }
+     }
+ 
++    suspend fun setGlobalNode(name: String?) {
++        withContext(Dispatchers.Main) {
++            binding.globalNode = name
++        }
++    }
++
+     suspend fun setHasProviders(has: Boolean) {
+         withContext(Dispatchers.Main) {
+             binding.hasProviders = has
+diff --git a/design/src/main/java/com/github/kr328/clash/design/ProxyDesign.kt b/design/src/main/java/com/github/kr328/clash/design/ProxyDesign.kt
+index 7dc7f41..45598d3 100644
+--- a/design/src/main/java/com/github/kr328/clash/design/ProxyDesign.kt
++++ b/design/src/main/java/com/github/kr328/clash/design/ProxyDesign.kt
+@@ -27,6 +27,7 @@ class ProxyDesign(
+     overrideMode: TunnelState.Mode?,
+     groupNames: List<String>,
+     uiStore: UiStore,
++    initialGroup: String? = null,
+ ) : Design<ProxyDesign.Request>(context) {
+     sealed class Request {
+         object ReloadAll : Request()
+@@ -142,7 +143,10 @@ class ProxyDesign(
+                 tab.text = groupNames[index]
+             }.attach()
+ 
+-            val initialPosition = groupNames.indexOf(uiStore.proxyLastGroup)
++            val preferredPosition = initialGroup?.let { groupNames.indexOf(it) } ?: -1
++            val initialPosition =
++                if (preferredPosition >= 0) preferredPosition
++                else groupNames.indexOf(uiStore.proxyLastGroup)
+ 
+             binding.pagesView.post {
+                 if (initialPosition > 0)
+diff --git a/design/src/main/java/com/github/kr328/clash/design/store/UiStore.kt b/design/src/main/java/com/github/kr328/clash/design/store/UiStore.kt
+index ddc9d60..5607117 100644
+--- a/design/src/main/java/com/github/kr328/clash/design/store/UiStore.kt
++++ b/design/src/main/java/com/github/kr328/clash/design/store/UiStore.kt
+@@ -62,6 +62,11 @@ class UiStore(context: Context) {
+         defaultValue = ""
+     )
+ 
++    var lastMode: String by store.string(
++        key = "last_mode",
++        defaultValue = ""
++    )
++
+     var accessControlSort: AppInfoSort by store.enum(
+         key = "access_control_sort",
+         defaultValue = AppInfoSort.Label,
+diff --git a/design/src/main/res/layout/design_main.xml b/design/src/main/res/layout/design_main.xml
+index a562970..328805a 100644
+--- a/design/src/main/res/layout/design_main.xml
++++ b/design/src/main/res/layout/design_main.xml
+@@ -14,6 +14,12 @@
+         <variable
+             name="mode"
+             type="String" />
++        <variable
++            name="globalMode"
++            type="boolean" />
++        <variable
++            name="globalNode"
++            type="String" />
+         <variable
+             name="profileName"
+             type="String" />
+@@ -100,6 +106,48 @@
+                     app:subtext="@{mode}"
+                     app:text="@string/proxy" />
+ 
++                <com.github.kr328.clash.design.view.LargeActionCard
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginVertical="@dimen/main_card_margin_vertical"
++                    android:onClick="@{() -> self.request(Request.ToggleGlobalMode)}"
++                    android:visibility="@{clashRunning ? View.VISIBLE : View.GONE}"
++                    app:icon="@drawable/ic_baseline_apps"
++                    app:subtext="@string/global_mode_hint"
++                    app:text="@string/global_mode">
++
++                    <LinearLayout
++                        android:layout_width="wrap_content"
++                        android:layout_height="wrap_content"
++                        android:layout_gravity="end|center_vertical"
++                        android:layout_marginEnd="@dimen/large_item_tailing_margin_horizontal"
++                        android:gravity="end|center_horizontal"
++                        android:orientation="vertical">
++
++                        <androidx.appcompat.widget.SwitchCompat
++                            android:id="@+id/globalModeSwitch"
++                            android:layout_width="wrap_content"
++                            android:layout_height="wrap_content"
++                            android:checked="@{globalMode}"
++                            android:clickable="false"
++                            android:focusable="false"
++                            android:saveEnabled="false" />
++
++                        <TextView
++                            android:id="@+id/globalNodeText"
++                            android:layout_width="wrap_content"
++                            android:layout_height="wrap_content"
++                            android:layout_marginTop="2dp"
++                            android:ellipsize="end"
++                            android:maxWidth="112dp"
++                            android:singleLine="true"
++                            android:text="@{globalNode}"
++                            android:textColor="?android:attr/textColorSecondary"
++                            android:textSize="11sp"
++                            android:visibility="@{globalMode ? View.VISIBLE : View.GONE}" />
++                    </LinearLayout>
++                </com.github.kr328.clash.design.view.LargeActionCard>
++
+                 <com.github.kr328.clash.design.view.LargeActionCard
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+diff --git a/design/src/main/res/values-zh/strings.xml b/design/src/main/res/values-zh/strings.xml
+index ee7daf7..d469d30 100644
+--- a/design/src/main/res/values-zh/strings.xml
++++ b/design/src/main/res/values-zh/strings.xml
+@@ -39,6 +39,7 @@
+     <string name="format_profile_activated">%s 已激活</string>
+     <string name="format_traffic_forwarded">%s 已转发</string>
+     <string name="global_mode">全局模式</string>
++    <string name="global_mode_hint">点此切换</string>
+     <string name="hide_app_icon_title">隐藏应用图标</string>
+     <string name="hide_app_icon_desc">可以在拨号盘输入 *#*#252746382#*#* 打开应用</string>
+     <string name="hide_from_recents_title">从最近任务隐藏</string>
+diff --git a/design/src/main/res/values/strings.xml b/design/src/main/res/values/strings.xml
+index a2f951e..637041b 100644
+--- a/design/src/main/res/values/strings.xml
++++ b/design/src/main/res/values/strings.xml
+@@ -1,8 +1,8 @@
+ <resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="PluralsCandidate">
+     <string name="launch_name_meta">Clash Meta</string>
+-    <string name="launch_name_alpha">Clash Meta Alpha</string>
++    <string name="launch_name_alpha">clash meta ui改版</string>
+     <string name="application_name_meta">Clash Meta for Android</string>
+-    <string name="application_name_alpha">Clash Meta for Android Alpha</string>
++    <string name="application_name_alpha">clash meta ui改版</string>
+ 
+     <string name="stopped">Stopped</string>
+     <string name="tap_to_start">Tap to start</string>
+@@ -13,6 +13,7 @@
+     <string name="direct_mode">Direct Mode</string>
+     <string name="rule_mode">Rule Mode</string>
+     <string name="global_mode">Global Mode</string>
++    <string name="global_mode_hint">Tap to switch</string>
+     <string name="proxy_empty_tips">No groups can be displayed</string>
+ 
+     <string name="profiles">Profiles</string>
+diff --git a/service/src/main/java/com/github/kr328/clash/service/clash/module/DynamicNotificationModule.kt b/service/src/main/java/com/github/kr328/clash/service/clash/module/DynamicNotificationModule.kt
+index 43aa3d6..04fabab 100644
+--- a/service/src/main/java/com/github/kr328/clash/service/clash/module/DynamicNotificationModule.kt
++++ b/service/src/main/java/com/github/kr328/clash/service/clash/module/DynamicNotificationModule.kt
+@@ -13,6 +13,8 @@ import com.github.kr328.clash.common.constants.Components
+ import com.github.kr328.clash.common.constants.Intents
+ import com.github.kr328.clash.common.util.ticker
+ import com.github.kr328.clash.core.Clash
++import com.github.kr328.clash.core.model.ProxySort
++import com.github.kr328.clash.core.model.TunnelState
+ import com.github.kr328.clash.core.util.trafficDownload
+ import com.github.kr328.clash.core.util.trafficUpload
+ import com.github.kr328.clash.service.R
+@@ -43,6 +45,25 @@ class DynamicNotificationModule(service: Service) : Module<Unit>(service) {
+ 
+     private val notificationManager = NotificationManagerCompat.from(service)
+ 
++    private fun queryTitle(): String {
++        val mode = runCatching { Clash.queryTunnelState().mode }.getOrNull()
++
++        val node = runCatching {
++            if (mode == TunnelState.Mode.Global) {
++                Clash.queryGroup("GLOBAL", ProxySort.Default).now
++            } else {
++                Clash.queryGroupNames(false).firstOrNull()
++                    ?.let { Clash.queryGroup(it, ProxySort.Default).now }
++            }
++        }.getOrNull().orEmpty()
++
++        return when {
++            node.isBlank() -> service.getString(R.string.clash_notification_unknown)
++            mode == TunnelState.Mode.Global -> service.getString(R.string.clash_notification_global, node)
++            else -> service.getString(R.string.clash_notification_rule, node)
++        }
++    }
++
+     private fun update() {
+         val now = Clash.queryTrafficNow()
+         val total = Clash.queryTrafficTotal()
+@@ -53,6 +74,7 @@ class DynamicNotificationModule(service: Service) : Module<Unit>(service) {
+         val downloaded = total.trafficDownload()
+ 
+         val notification = builder
++            .setContentTitle(queryTitle())
+             .setContentText(
+                 service.getString(
+                     R.string.clash_notification_content,
+@@ -95,7 +117,7 @@ class DynamicNotificationModule(service: Service) : Module<Unit>(service) {
+                     }
+                 }
+                 profileLoaded.onReceive {
+-                    builder.setContentTitle(StatusProvider.currentProfile ?: "Not selected")
++                    builder.setContentTitle(queryTitle())
+                 }
+                 if (shouldUpdate) {
+                     ticker.onReceive {
+diff --git a/service/src/main/res/values/strings.xml b/service/src/main/res/values/strings.xml
+index 903b825..bbd1efa 100644
+--- a/service/src/main/res/values/strings.xml
++++ b/service/src/main/res/values/strings.xml
+@@ -1,6 +1,9 @@
+ <resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="PluralsCandidate">
+     <!-- from https://github.com/shadowsocks/shadowsocks-android/blob/master/core/src/main/res/values/strings.xml -->
+     <string name="clash_notification_content" translatable="false">"%1$s↑\t%2$s↓"</string>
++    <string name="clash_notification_rule">默认规则 · %1$s</string>
++    <string name="clash_notification_global">全局 · %1$s</string>
++    <string name="clash_notification_unknown">未选择节点</string>
+ 
+     <string name="clash_service_status_channel">Clash Status</string>
+     <string name="profile_service_status">Profile Service Status</string>
